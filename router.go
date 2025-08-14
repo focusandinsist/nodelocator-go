@@ -1,0 +1,267 @@
+package sessionlocator
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"strconv"
+	"sync"
+	"time"
+
+	"nodelocator/consistent"
+	redisClient "nodelocator/redis"
+
+	"github.com/go-redis/redis/v8"
+)
+
+// GatewayInstance gateway instance information
+type GatewayInstance struct {
+	ID            string `json:"id"`
+	Host          string `json:"host"`
+	Port          int    `json:"port"`
+	LastHeartbeat int64  `json:"last_heartbeat"`
+}
+
+// String implement consistent.Member interface
+func (g *GatewayInstance) String() string {
+	return g.ID
+}
+
+// GetAddress get gateway address
+func (g *GatewayInstance) GetAddress() string {
+	return fmt.Sprintf("%s:%d", g.Host, g.Port)
+}
+
+// Locator session locator
+// Responsible for monitoring Redis ZSET changes and syncing to local consistent hash ring, providing routing decisions
+type Locator struct {
+	redis        *redisClient.RedisClient
+	ring         *consistent.Consistent
+	instances    map[string]*GatewayInstance // Instance ID -> Instance info
+	mu           sync.RWMutex
+	stopCh       chan struct{}
+	syncTicker   *time.Ticker
+	lastSyncTime int64 // Last sync timestamp, used for detecting changes
+}
+
+// NewLocator create session locator
+func NewLocator(redis *redisClient.RedisClient) *Locator {
+	// Configure consistent hash ring
+	config := consistent.Config{
+		Hasher:            consistent.NewCRC64Hasher(),
+		PartitionCount:    271,
+		ReplicationFactor: 20,
+		Load:              1.25,
+	}
+
+	locator := &Locator{
+		redis:     redis,
+		ring:      consistent.New(nil, config),
+		instances: make(map[string]*GatewayInstance),
+		stopCh:    make(chan struct{}),
+	}
+
+	// Sync active instances from Redis at startup
+	if err := locator.syncActiveGateways(); err != nil {
+		log.Printf("Failed to sync active gateways during initialization: %v", err)
+	}
+
+	// Start background monitoring task
+	locator.startMonitoring()
+
+	return locator
+}
+
+// GetGatewayForUser get corresponding gateway instance based on user ID
+func (l *Locator) GetGatewayForUser(userID string) (*GatewayInstance, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	key := fmt.Sprintf("user:%s", userID)
+	member := l.ring.LocateKey([]byte(key))
+	if member == nil {
+		return nil, fmt.Errorf("no available gateway instances")
+	}
+
+	// Get instance info directly from local cache, extremely high performance
+	if instance, ok := l.instances[member.String()]; ok {
+		return instance, nil
+	}
+
+	return nil, fmt.Errorf("instance %s found on hash ring does not exist in local cache, data may be inconsistent", member.String())
+}
+
+// GetGatewayForRoom get corresponding gateway instance based on room ID
+func (l *Locator) GetGatewayForRoom(roomID string) (*GatewayInstance, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	key := fmt.Sprintf("room:%s", roomID)
+	member := l.ring.LocateKey([]byte(key))
+	if member == nil {
+		return nil, fmt.Errorf("no available gateway instances")
+	}
+
+	// Get instance info directly from local cache, extremely high performance
+	if instance, ok := l.instances[member.String()]; ok {
+		return instance, nil
+	}
+
+	return nil, fmt.Errorf("instance %s found on hash ring does not exist in local cache, data may be inconsistent", member.String())
+}
+
+// GetAllActiveGateways get all active gateway instances
+func (l *Locator) GetAllActiveGateways() []*GatewayInstance {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	instances := make([]*GatewayInstance, 0, len(l.instances))
+	for _, instance := range l.instances {
+		instances = append(instances, instance)
+	}
+	return instances
+}
+
+// GetStats get routing statistics
+func (l *Locator) GetStats() map[string]interface{} {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	loadDist := l.ring.LoadDistribution()
+	return map[string]interface{}{
+		"active_gateways":   len(l.instances),
+		"average_load":      l.ring.AverageLoad(),
+		"load_distribution": loadDist,
+		"last_sync_time":    l.lastSyncTime,
+	}
+}
+
+// syncActiveGateways sync active gateway instances from Redis
+func (l *Locator) syncActiveGateways() error {
+	ctx := context.Background()
+
+	// 1: Get all active gateway IDs from Redis (lockless)
+	minScore := strconv.FormatInt(time.Now().Unix()-HeartbeatWindow, 10)
+	opt := &redis.ZRangeBy{Min: minScore, Max: "+inf"}
+	activeIDs, err := l.redis.ZRangeByScore(ctx, ActiveGatewaysKey, opt)
+	if err != nil {
+		return fmt.Errorf("failed to get active gateway list: %v", err)
+	}
+
+	// 2: Build expected latest state and get detailed info for all instances (lockless)
+	newState := make(map[string]*GatewayInstance)
+	for _, instanceID := range activeIDs {
+		instance, err := l.getInstanceDetails(ctx, instanceID)
+		if err != nil {
+			log.Printf("Failed to get instance %s details: %v, will skip this instance in current sync", instanceID, err)
+			continue // Skip instances that failed to get details
+		}
+		newState[instanceID] = instance
+	}
+
+	// 3: Compare and update local state (one-time write lock)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	var addedCount, removedCount int
+
+	// Find and remove offline instances
+	for localID := range l.instances {
+		if _, existsInNewState := newState[localID]; !existsInNewState {
+			l.ring.Remove(localID)
+			delete(l.instances, localID)
+			removedCount++
+			log.Printf("Removed gateway instance: %s", localID)
+		}
+	}
+
+	// Find and add newly online instances
+	for newID, newInstance := range newState {
+		if _, existsLocally := l.instances[newID]; !existsLocally {
+			l.instances[newID] = newInstance
+			l.ring.Add(newInstance)
+			addedCount++
+			log.Printf("Added gateway instance: %s (%s)", newID, newInstance.GetAddress())
+		}
+	}
+
+	if addedCount > 0 || removedCount > 0 {
+		l.lastSyncTime = time.Now().Unix()
+		log.Printf("Gateway instance sync completed, current active count: %d (added: %d, removed: %d)",
+			len(l.instances), addedCount, removedCount)
+	}
+
+	return nil
+}
+
+// getInstanceDetails get instance details from Redis Hash
+func (l *Locator) getInstanceDetails(ctx context.Context, instanceID string) (*GatewayInstance, error) {
+	key := fmt.Sprintf(GatewayInstanceHashKeyFmt, instanceID)
+	fields, err := l.redis.HGetAll(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(fields) == 0 {
+		return nil, fmt.Errorf("instance info does not exist")
+	}
+
+	// Parse port number
+	port := 8080 // Default value
+	if portStr, exists := fields["port"]; exists {
+		if p, err := strconv.Atoi(portStr); err == nil {
+			port = p
+		}
+	}
+
+	// Parse last heartbeat time
+	lastHeartbeat := time.Now().Unix()
+	if hbStr, exists := fields["last_ping"]; exists {
+		if hb, err := strconv.ParseInt(hbStr, 10, 64); err == nil {
+			lastHeartbeat = hb
+		}
+	}
+
+	return &GatewayInstance{
+		ID:            instanceID,
+		Host:          fields["host"],
+		Port:          port,
+		LastHeartbeat: lastHeartbeat,
+	}, nil
+}
+
+// startMonitoring start background monitoring task
+func (l *Locator) startMonitoring() {
+	// Use sync interval defined in constants
+	l.syncTicker = time.NewTicker(SyncInterval)
+	go l.periodicSync()
+}
+
+// periodicSync periodically sync active instances from Redis
+func (l *Locator) periodicSync() {
+	defer l.syncTicker.Stop()
+
+	for {
+		select {
+		case <-l.syncTicker.C:
+			if err := l.syncActiveGateways(); err != nil {
+				log.Printf("Failed to periodically sync active gateways: %v", err)
+			}
+		case <-l.stopCh:
+			return
+		}
+	}
+}
+
+// Stop stop locator
+func (l *Locator) Stop() {
+	close(l.stopCh)
+	if l.syncTicker != nil {
+		l.syncTicker.Stop()
+	}
+}
+
+// ForceSync force sync (for manual trigger sync)
+func (l *Locator) ForceSync() error {
+	return l.syncActiveGateways()
+}
