@@ -9,9 +9,6 @@ import (
 	"time"
 
 	"nodelocator/consistent"
-	redisClient "nodelocator/redis"
-
-	"github.com/go-redis/redis/v8"
 )
 
 // GatewayInstance gateway instance information
@@ -35,7 +32,7 @@ func (g *GatewayInstance) GetAddress() string {
 // Locator session locator
 // Responsible for monitoring Redis ZSET changes and syncing to local consistent hash ring, providing routing decisions
 type Locator struct {
-	redis        *redisClient.RedisClient
+	registry     ServiceRegistry
 	ring         *consistent.Consistent
 	instances    map[string]*GatewayInstance // Instance ID -> Instance info
 	mu           sync.RWMutex
@@ -44,18 +41,12 @@ type Locator struct {
 	lastSyncTime int64 // Last sync timestamp, used for detecting changes
 }
 
-// NewLocator create session locator
-func NewLocator(redis *redisClient.RedisClient) *Locator {
-	// Configure consistent hash ring
-	config := consistent.Config{
-		Hasher:            consistent.NewCRC64Hasher(),
-		PartitionCount:    271,
-		ReplicationFactor: 20,
-		Load:              1.25,
-	}
+// NewLocator creates a new session locator.
+// It requires a service registry for node discovery and a consistent hash configuration.
+func NewLocator(registry ServiceRegistry, config consistent.Config) *Locator {
 
 	locator := &Locator{
-		redis:     redis,
+		registry:  registry,
 		ring:      consistent.New(nil, config),
 		instances: make(map[string]*GatewayInstance),
 		stopCh:    make(chan struct{}),
@@ -72,42 +63,38 @@ func NewLocator(redis *redisClient.RedisClient) *Locator {
 	return locator
 }
 
-// GetGatewayForUser get corresponding gateway instance based on user ID
+// GetGatewayForUser gets the assigned gateway instance for a given user ID.
 func (l *Locator) GetGatewayForUser(userID string) (*GatewayInstance, error) {
-	l.mu.RLock()
-	defer l.mu.RUnlock()
-
-	key := fmt.Sprintf("user:%s", userID)
-	member := l.ring.LocateKey([]byte(key))
-	if member == nil {
-		return nil, fmt.Errorf("no available gateway instances")
-	}
-
-	// Get instance info directly from local cache, extremely high performance
-	if instance, ok := l.instances[member.String()]; ok {
-		return instance, nil
-	}
-
-	return nil, fmt.Errorf("instance %s found on hash ring does not exist in local cache, data may be inconsistent", member.String())
+	return l.getGateway("user:" + userID)
 }
 
-// GetGatewayForRoom get corresponding gateway instance based on room ID
+// GetGatewayForRoom gets the assigned gateway instance for a given room ID.
 func (l *Locator) GetGatewayForRoom(roomID string) (*GatewayInstance, error) {
+	return l.getGateway("room:" + roomID)
+}
+
+// getGateway is the internal implementation for locating a gateway.
+// It takes a key, computes the hash, and finds the corresponding instance.
+func (l *Locator) getGateway(key string) (*GatewayInstance, error) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
-	key := fmt.Sprintf("room:%s", roomID)
-	member := l.ring.LocateKey([]byte(key))
-	if member == nil {
+	if len(l.instances) == 0 {
 		return nil, fmt.Errorf("no available gateway instances")
 	}
 
-	// Get instance info directly from local cache, extremely high performance
-	if instance, ok := l.instances[member.String()]; ok {
-		return instance, nil
+	member := l.ring.LocateKey([]byte(key))
+	if member == nil {
+		// This should theoretically not happen if instances are available
+		return nil, fmt.Errorf("could not locate a gateway for the given key")
 	}
 
-	return nil, fmt.Errorf("instance %s found on hash ring does not exist in local cache, data may be inconsistent", member.String())
+	instance, ok := l.instances[member.String()]
+	if !ok {
+		return nil, fmt.Errorf("instance %s found on hash ring does not exist in local cache, data may be inconsistent", member.String())
+	}
+
+	return instance, nil
 }
 
 // GetAllActiveGateways get all active gateway instances
@@ -142,8 +129,8 @@ func (l *Locator) syncActiveGateways() error {
 
 	// 1: Get all active gateway IDs from Redis (lockless)
 	minScore := strconv.FormatInt(time.Now().Unix()-HeartbeatWindow, 10)
-	opt := &redis.ZRangeBy{Min: minScore, Max: "+inf"}
-	activeIDs, err := l.redis.ZRangeByScore(ctx, ActiveGatewaysKey, opt)
+	opt := &ZRangeOptions{Min: minScore, Max: "+inf"}
+	activeIDs, err := l.registry.ZRangeByScore(ctx, ActiveGatewaysKey, opt)
 	if err != nil {
 		return fmt.Errorf("failed to get active gateway list: %v", err)
 	}
@@ -197,7 +184,7 @@ func (l *Locator) syncActiveGateways() error {
 // getInstanceDetails get instance details from Redis Hash
 func (l *Locator) getInstanceDetails(ctx context.Context, instanceID string) (*GatewayInstance, error) {
 	key := fmt.Sprintf(GatewayInstanceHashKeyFmt, instanceID)
-	fields, err := l.redis.HGetAll(ctx, key)
+	fields, err := l.registry.HGetAll(ctx, key)
 	if err != nil {
 		return nil, err
 	}

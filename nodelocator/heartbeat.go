@@ -5,16 +5,12 @@ import (
 	"fmt"
 	"log"
 	"time"
-
-	redisClient "nodelocator/redis"
-
-	"github.com/go-redis/redis/v8"
 )
 
 // HeartbeatManager gateway heartbeat manager
 // Used for gateway service to manage registration, heartbeat and deregistration by itself
 type HeartbeatManager struct {
-	redis      *redisClient.RedisClient
+	registry   ServiceRegistry
 	instanceID string
 	host       string
 	port       int
@@ -23,9 +19,9 @@ type HeartbeatManager struct {
 }
 
 // NewHeartbeatManager create heartbeat manager
-func NewHeartbeatManager(redis *redisClient.RedisClient, instanceID, host string, port int) *HeartbeatManager {
+func NewHeartbeatManager(registry ServiceRegistry, instanceID, host string, port int) *HeartbeatManager {
 	return &HeartbeatManager{
-		redis:      redis,
+		registry:   registry,
 		instanceID: instanceID,
 		host:       host,
 		port:       port,
@@ -40,8 +36,7 @@ func (hm *HeartbeatManager) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to register gateway instance: %v", err)
 	}
 
-	// Start heartbeat
-	hm.startHeartbeat()
+	hm.startHeartbeat(ctx)
 
 	log.Printf("Heartbeat manager started: %s (%s:%d)", hm.instanceID, hm.host, hm.port)
 	return nil
@@ -67,9 +62,10 @@ func (hm *HeartbeatManager) Stop(ctx context.Context) error {
 // register register gateway instance to Redis ZSET
 func (hm *HeartbeatManager) register(ctx context.Context) error {
 	// Add to Redis ZSET
-	score := float64(time.Now().Unix())
-	z := &redis.Z{Score: score, Member: hm.instanceID}
-	if err := hm.redis.ZAdd(ctx, ActiveGatewaysKey, z); err != nil {
+	now := time.Now().Unix()
+	score := float64(now)
+	z := &ZMember{Score: score, Member: hm.instanceID}
+	if err := hm.registry.ZAdd(ctx, ActiveGatewaysKey, z); err != nil {
 		return fmt.Errorf("failed to register to Redis ZSET: %v", err)
 	}
 
@@ -79,17 +75,17 @@ func (hm *HeartbeatManager) register(ctx context.Context) error {
 		"id":             hm.instanceID,
 		"host":           hm.host,
 		"port":           hm.port,
-		"registered_at":  time.Now().Unix(),
-		"last_heartbeat": time.Now().Unix(),
+		"registered_at":  now,
+		"last_heartbeat": now,
 	}
 
-	if err := hm.redis.HMSet(ctx, instanceKey, instanceInfo); err != nil {
+	if err := hm.registry.HMSet(ctx, instanceKey, instanceInfo); err != nil {
 		log.Printf("Failed to save instance details: %v", err)
 	}
 
 	// Set Hash expiration time (heartbeat window + 30 seconds buffer)
 	expireTime := time.Duration(HeartbeatWindow+30) * time.Second
-	if err := hm.redis.Expire(ctx, instanceKey, expireTime); err != nil {
+	if err := hm.registry.Expire(ctx, instanceKey, expireTime); err != nil {
 		log.Printf("Failed to set instance info expiration time: %v", err)
 	}
 
@@ -99,21 +95,21 @@ func (hm *HeartbeatManager) register(ctx context.Context) error {
 // unregister unregister gateway instance from Redis ZSET
 func (hm *HeartbeatManager) unregister(ctx context.Context) error {
 	// Remove from Redis ZSET
-	if err := hm.redis.ZRem(ctx, ActiveGatewaysKey, hm.instanceID); err != nil {
+	if err := hm.registry.ZRem(ctx, ActiveGatewaysKey, hm.instanceID); err != nil {
 		return fmt.Errorf("failed to remove from Redis ZSET: %v", err)
 	}
 
 	// Delete instance details
 	instanceKey := fmt.Sprintf(GatewayInstanceHashKeyFmt, hm.instanceID)
-	if err := hm.redis.Del(ctx, instanceKey); err != nil {
+	if err := hm.registry.Del(ctx, instanceKey); err != nil {
 		log.Printf("Failed to delete instance details: %v", err)
 	}
 
 	return nil
 }
 
-// startHeartbeat start heartbeat loop
-func (hm *HeartbeatManager) startHeartbeat() {
+// startHeartbeat starts the heartbeat loop, cancellable by the provided context.
+func (hm *HeartbeatManager) startHeartbeat(ctx context.Context) {
 	// Use heartbeat interval defined in constants
 	hm.ticker = time.NewTicker(HeartbeatInterval)
 
@@ -123,11 +119,16 @@ func (hm *HeartbeatManager) startHeartbeat() {
 		for {
 			select {
 			case <-hm.ticker.C:
-				ctx := context.Background()
-				if err := hm.sendHeartbeat(ctx); err != nil {
+				// Create a timeout context for a single heartbeat operation
+				hbCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				if err := hm.sendHeartbeat(hbCtx); err != nil {
 					log.Printf("Failed to send heartbeat: %v", err)
 				}
+				cancel()
 			case <-hm.stopCh:
+				return
+			case <-ctx.Done(): // Listen for cancellation from the parent context
+				log.Printf("Heartbeat context cancelled, stopping heartbeat for instance %s.", hm.instanceID)
 				return
 			}
 		}
@@ -137,21 +138,22 @@ func (hm *HeartbeatManager) startHeartbeat() {
 // sendHeartbeat send heartbeat
 func (hm *HeartbeatManager) sendHeartbeat(ctx context.Context) error {
 	// Update score (timestamp) in Redis ZSET
-	score := float64(time.Now().Unix())
-	z := &redis.Z{Score: score, Member: hm.instanceID}
-	if err := hm.redis.ZAdd(ctx, ActiveGatewaysKey, z); err != nil {
+	now := time.Now().Unix()
+	score := float64(now)
+	z := &ZMember{Score: score, Member: hm.instanceID}
+	if err := hm.registry.ZAdd(ctx, ActiveGatewaysKey, z); err != nil {
 		return fmt.Errorf("failed to update heartbeat: %v", err)
 	}
 
 	// Update heartbeat time in instance details
 	instanceKey := fmt.Sprintf(GatewayInstanceHashKeyFmt, hm.instanceID)
-	if err := hm.redis.HSet(ctx, instanceKey, "last_heartbeat", time.Now().Unix()); err != nil {
+	if err := hm.registry.HSet(ctx, instanceKey, "last_heartbeat", now); err != nil {
 		log.Printf("Failed to update instance heartbeat time: %v", err)
 	}
 
 	// Renew Hash expiration (heartbeat window + 30 seconds buffer)
 	expireTime := time.Duration(HeartbeatWindow+30) * time.Second
-	if err := hm.redis.Expire(ctx, instanceKey, expireTime); err != nil {
+	if err := hm.registry.Expire(ctx, instanceKey, expireTime); err != nil {
 		log.Printf("Failed to renew instance info expiration: %v", err)
 	}
 
