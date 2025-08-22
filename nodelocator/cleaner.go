@@ -13,23 +13,9 @@ import (
   NOTE:
   Used to clean up redis instance routing table when instances go offline/fail.
   It includes a self-contained leader election mechanism using a Redis distributed lock,
-  to ensure the cleanup task runs as a global singleton. As an alternative, you can 
+  to ensure the cleanup task runs as a global singleton. As an alternative, you can
   disable this internal cleaner and use your own scheduled tasks or other tools like k8s cronJob.
 */
-
-const (
-	// LeaderLockKey Redis key for leader election lock
-	LeaderLockKey = "service:logic:leader_lock"
-
-	// LeaderElectionInterval leader election interval
-	LeaderElectionInterval = 30 * time.Second
-
-	// LeaderLockTTL TTL for leader lock
-	LeaderLockTTL = 60 * time.Second
-
-	// CleanupTaskInterval cleanup task execution interval
-	CleanupTaskInterval = 5 * time.Minute
-)
 
 // Cleaner gateway instance cleaner
 type Cleaner struct {
@@ -37,6 +23,7 @@ type Cleaner struct {
 	instanceID string
 	isLeader   bool
 	stopCh     chan struct{}
+	config     *Config
 
 	// Election related
 	electionTicker *time.Ticker
@@ -45,13 +32,17 @@ type Cleaner struct {
 	cleanupTicker *time.Ticker
 }
 
-// NewCleaner create cleaner
-func NewCleaner(registry ServiceRegistry, instanceID string) *Cleaner {
+// NewCleaner creates a new cleaner instance.
+func NewCleaner(registry ServiceRegistry, instanceID string, cfg *Config) *Cleaner {
+	if cfg == nil {
+		cfg = DefaultConfig()
+	}
 	return &Cleaner{
 		registry:   registry,
 		instanceID: instanceID,
 		isLeader:   false,
 		stopCh:     make(chan struct{}),
+		config:     cfg,
 	}
 }
 
@@ -60,7 +51,7 @@ func (c *Cleaner) Start(ctx context.Context) {
 	log.Printf("Starting gateway cleaner, instance ID: %s", c.instanceID)
 
 	// Start leader election
-	c.electionTicker = time.NewTicker(LeaderElectionInterval)
+	c.electionTicker = time.NewTicker(c.config.LeaderElectionInterval)
 	go c.leaderElection(ctx)
 
 	// Try election immediately once
@@ -105,7 +96,7 @@ func (c *Cleaner) leaderElection(ctx context.Context) {
 // tryBecomeLeader try to become leader
 func (c *Cleaner) tryBecomeLeader(ctx context.Context) {
 	// Try to acquire leader lock
-	ok, err := c.registry.SetNX(ctx, LeaderLockKey, c.instanceID, LeaderLockTTL)
+	ok, err := c.registry.SetNX(ctx, LeaderLockKey, c.instanceID, c.config.LeaderLockTTL)
 	if err != nil {
 		log.Printf("Leader election failed: %v", err)
 		return
@@ -143,7 +134,7 @@ func (c *Cleaner) startCleanupTask(ctx context.Context) {
 		c.cleanupTicker.Stop()
 	}
 
-	c.cleanupTicker = time.NewTicker(CleanupTaskInterval)
+	c.cleanupTicker = time.NewTicker(c.config.CleanupInterval)
 
 	// Execute cleanup immediately once
 	go c.executeCleanup(ctx)
@@ -178,7 +169,7 @@ func (c *Cleaner) executeCleanup(ctx context.Context) {
 	log.Printf("Executing gateway instance cleanup task...")
 
 	// Calculate expired timestamp
-	expiredBefore := time.Now().Unix() - HeartbeatWindow
+	expiredBefore := time.Now().Unix() - int64(c.config.HeartbeatWindow.Seconds())
 
 	// 1. First get the number of instances to be deleted (for logging)
 	expiredOpt := &ZRangeOptions{

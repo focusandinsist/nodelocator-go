@@ -16,16 +16,21 @@ type HeartbeatManager struct {
 	port       int
 	stopCh     chan struct{}
 	ticker     *time.Ticker
+	config     *Config
 }
 
-// NewHeartbeatManager create heartbeat manager
-func NewHeartbeatManager(registry ServiceRegistry, instanceID, host string, port int) *HeartbeatManager {
+// NewHeartbeatManager creates a new heartbeat manager.
+func NewHeartbeatManager(registry ServiceRegistry, instanceID, host string, port int, cfg *Config) *HeartbeatManager {
+	if cfg == nil {
+		cfg = DefaultConfig()
+	}
 	return &HeartbeatManager{
 		registry:   registry,
 		instanceID: instanceID,
 		host:       host,
 		port:       port,
 		stopCh:     make(chan struct{}),
+		config:     cfg,
 	}
 }
 
@@ -84,7 +89,7 @@ func (hm *HeartbeatManager) register(ctx context.Context) error {
 	}
 
 	// Set Hash expiration time (heartbeat window + 30 seconds buffer)
-	expireTime := time.Duration(HeartbeatWindow+30) * time.Second
+	expireTime := hm.config.HeartbeatWindow + 30*time.Second
 	if err := hm.registry.Expire(ctx, instanceKey, expireTime); err != nil {
 		log.Printf("Failed to set instance info expiration time: %v", err)
 	}
@@ -111,7 +116,7 @@ func (hm *HeartbeatManager) unregister(ctx context.Context) error {
 // startHeartbeat starts the heartbeat loop, cancellable by the provided context.
 func (hm *HeartbeatManager) startHeartbeat(ctx context.Context) {
 	// Use heartbeat interval defined in constants
-	hm.ticker = time.NewTicker(HeartbeatInterval)
+	hm.ticker = time.NewTicker(hm.config.HeartbeatInterval)
 
 	go func() {
 		defer hm.ticker.Stop()
@@ -152,7 +157,7 @@ func (hm *HeartbeatManager) sendHeartbeat(ctx context.Context) error {
 	}
 
 	// Renew Hash expiration (heartbeat window + 30 seconds buffer)
-	expireTime := time.Duration(HeartbeatWindow+30) * time.Second
+	expireTime := hm.config.HeartbeatWindow + 30*time.Second
 	if err := hm.registry.Expire(ctx, instanceKey, expireTime); err != nil {
 		log.Printf("Failed to renew instance info expiration: %v", err)
 	}

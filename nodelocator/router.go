@@ -39,17 +39,22 @@ type Locator struct {
 	stopCh       chan struct{}
 	syncTicker   *time.Ticker
 	lastSyncTime int64 // Last sync timestamp, used for detecting changes
+	config       *Config
 }
 
 // NewLocator creates a new session locator.
-// It requires a service registry for node discovery and a consistent hash configuration.
-func NewLocator(registry ServiceRegistry, config consistent.Config) *Locator {
+func NewLocator(registry ServiceRegistry, consisCfg consistent.Config, cfg *Config) *Locator {
+
+	if cfg == nil {
+		cfg = DefaultConfig()
+	}
 
 	locator := &Locator{
 		registry:  registry,
-		ring:      consistent.New(nil, config),
+		ring:      consistent.New(nil, consisCfg),
 		instances: make(map[string]*GatewayInstance),
 		stopCh:    make(chan struct{}),
+		config:    cfg,
 	}
 
 	// Sync active instances from Redis at startup
@@ -128,7 +133,7 @@ func (l *Locator) syncActiveGateways() error {
 	ctx := context.Background()
 
 	// 1: Get all active gateway IDs from Redis (lockless)
-	minScore := strconv.FormatInt(time.Now().Unix()-HeartbeatWindow, 10)
+	minScore := strconv.FormatInt(time.Now().Unix()-int64(l.config.HeartbeatWindow.Seconds()), 10)
 	opt := &ZRangeOptions{Min: minScore, Max: "+inf"}
 	activeIDs, err := l.registry.ZRangeByScore(ctx, ActiveGatewaysKey, opt)
 	if err != nil {
@@ -220,7 +225,7 @@ func (l *Locator) getInstanceDetails(ctx context.Context, instanceID string) (*G
 // startMonitoring start background monitoring task
 func (l *Locator) startMonitoring() {
 	// Use sync interval defined in constants
-	l.syncTicker = time.NewTicker(SyncInterval)
+	l.syncTicker = time.NewTicker(l.config.SyncInterval)
 	go l.periodicSync()
 }
 
