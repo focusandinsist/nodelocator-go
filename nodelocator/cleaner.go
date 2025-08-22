@@ -1,4 +1,4 @@
-package sessionlocator
+package nodelocator
 
 import (
 	"context"
@@ -7,45 +7,23 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/go-redis/redis/v8"
-
-	redisClient "nodelocator/redis"
 )
-
-// // RedisClient Redis client
-// type RedisClient struct {
-// 	client *redis.Client
-// }
 
 /*
-  TODO
+  NOTE:
   Used to clean up redis instance routing table when instances go offline/fail.
-  This is a temporary solution that uses redis to implement a distributed lock for leader election,
-  to ensure that Cleaner is globally singleton and tasks are not executed repeatedly by other instances.
-  In the future, scheduled cleanup tasks will be changed to k8s cronJob execution or a new monitor service, TBD.
+  It includes a self-contained leader election mechanism using a Redis distributed lock,
+  to ensure the cleanup task runs as a global singleton. As an alternative, you can
+  disable this internal cleaner and use your own scheduled tasks or other tools like k8s cronJob.
 */
-
-const (
-	// LeaderLockKey Redis key for leader election lock
-	LeaderLockKey = "service:logic:leader_lock"
-
-	// LeaderElectionInterval leader election interval
-	LeaderElectionInterval = 30 * time.Second
-
-	// LeaderLockTTL TTL for leader lock
-	LeaderLockTTL = 60 * time.Second
-
-	// CleanupTaskInterval cleanup task execution interval
-	CleanupTaskInterval = 5 * time.Minute
-)
 
 // Cleaner gateway instance cleaner
 type Cleaner struct {
-	redis      *redisClient.RedisClient
+	registry   ServiceRegistry
 	instanceID string
 	isLeader   bool
 	stopCh     chan struct{}
+	config     *Config
 
 	// Election related
 	electionTicker *time.Ticker
@@ -54,13 +32,17 @@ type Cleaner struct {
 	cleanupTicker *time.Ticker
 }
 
-// NewCleaner create cleaner
-func NewCleaner(redis *redisClient.RedisClient, instanceID string) *Cleaner {
+// NewCleaner creates a new cleaner instance.
+func NewCleaner(registry ServiceRegistry, instanceID string, cfg *Config) *Cleaner {
+	if cfg == nil {
+		cfg = DefaultConfig()
+	}
 	return &Cleaner{
-		redis:      redis,
+		registry:   registry,
 		instanceID: instanceID,
 		isLeader:   false,
 		stopCh:     make(chan struct{}),
+		config:     cfg,
 	}
 }
 
@@ -69,7 +51,7 @@ func (c *Cleaner) Start(ctx context.Context) {
 	log.Printf("Starting gateway cleaner, instance ID: %s", c.instanceID)
 
 	// Start leader election
-	c.electionTicker = time.NewTicker(LeaderElectionInterval)
+	c.electionTicker = time.NewTicker(c.config.LeaderElectionInterval)
 	go c.leaderElection(ctx)
 
 	// Try election immediately once
@@ -114,7 +96,7 @@ func (c *Cleaner) leaderElection(ctx context.Context) {
 // tryBecomeLeader try to become leader
 func (c *Cleaner) tryBecomeLeader(ctx context.Context) {
 	// Try to acquire leader lock
-	ok, err := c.redis.SetNX(ctx, LeaderLockKey, c.instanceID, LeaderLockTTL)
+	ok, err := c.registry.SetNX(ctx, LeaderLockKey, c.instanceID, c.config.LeaderLockTTL)
 	if err != nil {
 		log.Printf("Leader election failed: %v", err)
 		return
@@ -132,7 +114,7 @@ func (c *Cleaner) tryBecomeLeader(ctx context.Context) {
 		}
 	} else {
 		// Failed to acquire lock, check current leader
-		currentLeader, err := c.redis.Get(ctx, LeaderLockKey)
+		currentLeader, err := c.registry.Get(ctx, LeaderLockKey)
 		if err != nil {
 			log.Printf("Failed to get current leader: %v", err)
 		} else {
@@ -152,7 +134,7 @@ func (c *Cleaner) startCleanupTask(ctx context.Context) {
 		c.cleanupTicker.Stop()
 	}
 
-	c.cleanupTicker = time.NewTicker(CleanupTaskInterval)
+	c.cleanupTicker = time.NewTicker(c.config.CleanupInterval)
 
 	// Execute cleanup immediately once
 	go c.executeCleanup(ctx)
@@ -187,14 +169,14 @@ func (c *Cleaner) executeCleanup(ctx context.Context) {
 	log.Printf("Executing gateway instance cleanup task...")
 
 	// Calculate expired timestamp
-	expiredBefore := time.Now().Unix() - HeartbeatWindow
+	expiredBefore := time.Now().Unix() - int64(c.config.HeartbeatWindow.Seconds())
 
 	// 1. First get the number of instances to be deleted (for logging)
-	expiredOpt := &redis.ZRangeBy{
+	expiredOpt := &ZRangeOptions{
 		Min: "0",
 		Max: strconv.FormatInt(expiredBefore, 10),
 	}
-	expiredInstances, err := c.redis.ZRangeByScore(ctx, ActiveGatewaysKey, expiredOpt)
+	expiredInstances, err := c.registry.ZRangeByScore(ctx, ActiveGatewaysKey, expiredOpt)
 	if err != nil {
 		log.Printf("Failed to get expired instances: %v", err)
 		return
@@ -202,7 +184,7 @@ func (c *Cleaner) executeCleanup(ctx context.Context) {
 
 	// 2. Clean expired instances from ZSET
 	if len(expiredInstances) > 0 {
-		err = c.redis.ZRemRangeByScore(ctx, ActiveGatewaysKey, "0", strconv.FormatInt(expiredBefore, 10))
+		err = c.registry.ZRemRangeByScore(ctx, ActiveGatewaysKey, "0", strconv.FormatInt(expiredBefore, 10))
 		if err != nil {
 			log.Printf("Failed to clean expired instances from ZSET: %v", err)
 			return
@@ -227,28 +209,38 @@ func (c *Cleaner) executeCleanup(ctx context.Context) {
 
 // cleanupOrphanedHashes clean orphaned hashes
 func (c *Cleaner) cleanupOrphanedHashes(ctx context.Context) (int, error) {
-	// Get all gateway_instances:* keys
+	var cursor uint64
+	var allKeys []string
 	pattern := fmt.Sprintf(GatewayInstanceHashKeyFmt, "*")
-	hashKeys, err := c.redis.Keys(ctx, pattern)
-	if err != nil {
-		return 0, fmt.Errorf("failed to get hash keys: %v", err)
+
+	// Loop through all pages of SCAN results
+	for {
+		keys, nextCursor, err := c.registry.Scan(ctx, cursor, pattern, 50) // 50 keys per iteration
+		if err != nil {
+			return 0, fmt.Errorf("failed to scan keys: %v", err)
+		}
+		allKeys = append(allKeys, keys...)
+		if nextCursor == 0 {
+			break
+		}
+		cursor = nextCursor
 	}
 
-	if len(hashKeys) == 0 {
+	if len(allKeys) == 0 {
 		return 0, nil
 	}
 
 	// Get all instance IDs from ZSET
-	allOpt := &redis.ZRangeBy{
+	allOpt := &ZRangeOptions{
 		Min: "-inf",
 		Max: "+inf",
 	}
-	activeIDs, err := c.redis.ZRangeByScore(ctx, ActiveGatewaysKey, allOpt)
+	activeIDs, err := c.registry.ZRangeByScore(ctx, ActiveGatewaysKey, allOpt)
 	if err != nil {
 		return 0, fmt.Errorf("failed to get ZSET instances: %v", err)
 	}
 
-	// Build map of active instance IDs
+	// Build map of active instance IDs for quick lookup
 	activeIDMap := make(map[string]bool)
 	for _, id := range activeIDs {
 		activeIDMap[id] = true
@@ -256,13 +248,13 @@ func (c *Cleaner) cleanupOrphanedHashes(ctx context.Context) (int, error) {
 
 	// Check and delete orphaned hashes
 	orphanedCount := 0
-	for _, hashKey := range hashKeys {
+	for _, hashKey := range allKeys {
 		// Extract instanceID from key
 		instanceID := strings.TrimPrefix(hashKey, "gateway_instances:")
 
 		// If this instance is not in ZSET, delete the hash
 		if !activeIDMap[instanceID] {
-			if err := c.redis.Del(ctx, hashKey); err != nil {
+			if err := c.registry.Del(ctx, hashKey); err != nil {
 				log.Printf("Failed to delete orphaned hash %s: %v", hashKey, err)
 			} else {
 				orphanedCount++
@@ -277,14 +269,14 @@ func (c *Cleaner) cleanupOrphanedHashes(ctx context.Context) (int, error) {
 // releaseLock release leader lock
 func (c *Cleaner) releaseLock(ctx context.Context) {
 	// Only release if current instance is the lock holder
-	currentLeader, err := c.redis.Get(ctx, LeaderLockKey)
+	currentLeader, err := c.registry.Get(ctx, LeaderLockKey)
 	if err != nil {
 		log.Printf("Failed to get current leader: %v", err)
 		return
 	}
 
 	if currentLeader == c.instanceID {
-		if err := c.redis.Del(ctx, LeaderLockKey); err != nil {
+		if err := c.registry.Del(ctx, LeaderLockKey); err != nil {
 			log.Printf("Failed to release leader lock: %v", err)
 		} else {
 			log.Printf("Leader lock released")
@@ -292,12 +284,12 @@ func (c *Cleaner) releaseLock(ctx context.Context) {
 	}
 }
 
-// IsLeader check if is leader
+// IsLeader .
 func (c *Cleaner) IsLeader() bool {
 	return c.isLeader
 }
 
 // GetLeaderInfo get current leader information
 func (c *Cleaner) GetLeaderInfo(ctx context.Context) (string, error) {
-	return c.redis.Get(ctx, LeaderLockKey)
+	return c.registry.Get(ctx, LeaderLockKey)
 }
