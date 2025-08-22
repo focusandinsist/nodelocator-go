@@ -1,4 +1,4 @@
-package sessionlocator
+package nodelocator
 
 import (
 	"context"
@@ -13,17 +13,17 @@ import (
 	redisClient "nodelocator/redis"
 )
 
-// // RedisClient Redis client
-// type RedisClient struct {
-// 	client *redis.Client
-// }
+// RedisClient Redis client
+type RedisClient struct {
+	client *redis.Client
+}
 
 /*
-  TODO
+  NOTE:
   Used to clean up redis instance routing table when instances go offline/fail.
   This is a temporary solution that uses redis to implement a distributed lock for leader election,
   to ensure that Cleaner is globally singleton and tasks are not executed repeatedly by other instances.
-  In the future, scheduled cleanup tasks will be changed to k8s cronJob execution or a new monitor service, TBD.
+  You can use your own scheduled tasks or other tools like k8s cronJob.
 */
 
 const (

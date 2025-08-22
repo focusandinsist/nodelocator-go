@@ -1,4 +1,4 @@
-package sessionlocator
+package nodelocator
 
 import "time"
 
