@@ -8,7 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"nodelocator/consistent"
+	// "nodelocator/consistent"
+	"github.com/focusandinsist/consistent-go/consistent"
 )
 
 // GatewayInstance gateway instance information
@@ -49,9 +50,13 @@ func NewLocator(registry ServiceRegistry, consisCfg consistent.Config, cfg *Conf
 		cfg = DefaultConfig()
 	}
 
+	ring, err := consistent.New(consisCfg)
+	if err != nil {
+		return nil
+	}
 	locator := &Locator{
 		registry:  registry,
-		ring:      consistent.New(nil, consisCfg),
+		ring:      ring,
 		instances: make(map[string]*GatewayInstance),
 		stopCh:    make(chan struct{}),
 		config:    cfg,
@@ -69,18 +74,18 @@ func NewLocator(registry ServiceRegistry, consisCfg consistent.Config, cfg *Conf
 }
 
 // GetGatewayForUser gets the assigned gateway instance for a given user ID.
-func (l *Locator) GetGatewayForUser(userID string) (*GatewayInstance, error) {
-	return l.getGateway("user:" + userID)
+func (l *Locator) GetGatewayForUser(ctx context.Context, userID string) (*GatewayInstance, error) {
+	return l.getGateway(ctx, "user:"+userID)
 }
 
 // GetGatewayForRoom gets the assigned gateway instance for a given room ID.
-func (l *Locator) GetGatewayForRoom(roomID string) (*GatewayInstance, error) {
-	return l.getGateway("room:" + roomID)
+func (l *Locator) GetGatewayForRoom(ctx context.Context, roomID string) (*GatewayInstance, error) {
+	return l.getGateway(ctx, "room:"+roomID)
 }
 
 // getGateway is the internal implementation for locating a gateway.
 // It takes a key, computes the hash, and finds the corresponding instance.
-func (l *Locator) getGateway(key string) (*GatewayInstance, error) {
+func (l *Locator) getGateway(ctx context.Context, key string) (*GatewayInstance, error) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
@@ -88,15 +93,15 @@ func (l *Locator) getGateway(key string) (*GatewayInstance, error) {
 		return nil, fmt.Errorf("no available gateway instances")
 	}
 
-	member := l.ring.LocateKey([]byte(key))
-	if member == nil {
+	member := l.ring.LocateKey(ctx, []byte(key))
+	if member == "" {
 		// This should theoretically not happen if instances are available
 		return nil, fmt.Errorf("could not locate a gateway for the given key")
 	}
 
-	instance, ok := l.instances[member.String()]
+	instance, ok := l.instances[member]
 	if !ok {
-		return nil, fmt.Errorf("instance %s found on hash ring does not exist in local cache, data may be inconsistent", member.String())
+		return nil, fmt.Errorf("instance %s found on hash ring does not exist in local cache, data may be inconsistent", member)
 	}
 
 	return instance, nil
@@ -115,14 +120,14 @@ func (l *Locator) GetAllActiveGateways() []*GatewayInstance {
 }
 
 // GetStats get routing statistics
-func (l *Locator) GetStats() map[string]interface{} {
+func (l *Locator) GetStats(ctx context.Context) map[string]interface{} {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
-	loadDist := l.ring.LoadDistribution()
+	loadDist := l.ring.LoadDistribution(ctx)
 	return map[string]interface{}{
 		"active_gateways":   len(l.instances),
-		"average_load":      l.ring.AverageLoad(),
+		"average_load":      l.ring.AverageLoad(ctx),
 		"load_distribution": loadDist,
 		"last_sync_time":    l.lastSyncTime,
 	}
@@ -160,7 +165,7 @@ func (l *Locator) syncActiveGateways() error {
 	// Find and remove offline instances
 	for localID := range l.instances {
 		if _, existsInNewState := newState[localID]; !existsInNewState {
-			l.ring.Remove(localID)
+			l.ring.Remove(ctx, localID)
 			delete(l.instances, localID)
 			removedCount++
 			log.Printf("Removed gateway instance: %s", localID)
@@ -171,7 +176,7 @@ func (l *Locator) syncActiveGateways() error {
 	for newID, newInstance := range newState {
 		if _, existsLocally := l.instances[newID]; !existsLocally {
 			l.instances[newID] = newInstance
-			l.ring.Add(newInstance)
+			l.ring.Add(ctx, newInstance.String())
 			addedCount++
 			log.Printf("Added gateway instance: %s (%s)", newID, newInstance.GetAddress())
 		}
