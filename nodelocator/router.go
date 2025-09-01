@@ -19,8 +19,8 @@ type GatewayInstance struct {
 	LastHeartbeat int64  `json:"last_heartbeat"`
 }
 
-// String implement consistent.Member interface
-func (g *GatewayInstance) String() string {
+// MemberID implement consistent.Member interface
+func (g *GatewayInstance) MemberID() string {
 	return g.ID
 }
 
@@ -92,15 +92,9 @@ func (l *Locator) getGateway(ctx context.Context, key string) (*GatewayInstance,
 		return nil, fmt.Errorf("no available gateway instances")
 	}
 
-	member := l.ring.LocateKey(ctx, []byte(key))
-	if member == "" {
-		select {
-		case <-ctx.Done():
-			return nil, fmt.Errorf("operation cancelled: %w", ctx.Err())
-		default:
-			// Partition has no owner, indicates hash ring inconsistent state
-			return nil, fmt.Errorf("could not locate a gateway for the given key, hash ring may be in inconsistent state")
-		}
+	member, err := l.ring.LocateKey(ctx, []byte(key))
+	if err != nil {
+		return nil, fmt.Errorf("failed to locate gateway for key '%s': %w", key, err)
 	}
 
 	instance, ok := l.instances[member]
@@ -112,13 +106,13 @@ func (l *Locator) getGateway(ctx context.Context, key string) (*GatewayInstance,
 }
 
 // GetAllActiveGateways get all active gateway instances
-func (l *Locator) GetAllActiveGateways() []*GatewayInstance {
+func (l *Locator) GetAllActiveGateways() []GatewayInstance {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
-	instances := make([]*GatewayInstance, 0, len(l.instances))
+	instances := make([]GatewayInstance, 0, len(l.instances))
 	for _, instance := range l.instances {
-		instances = append(instances, instance)
+		instances = append(instances, *instance) // Return a copy
 	}
 	return instances
 }
@@ -129,9 +123,14 @@ func (l *Locator) GetStats(ctx context.Context) map[string]interface{} {
 	defer l.mu.RUnlock()
 
 	loadDist := l.ring.LoadDistribution(ctx)
+	avgLoad, err := l.ring.AverageLoad(ctx)
+	if err != nil {
+		log.Printf("WARN: could not retrieve average load for stats: %v", err)
+		avgLoad = 0
+	}
 	return map[string]interface{}{
 		"active_gateways":   len(l.instances),
-		"average_load":      l.ring.AverageLoad(ctx),
+		"average_load":      avgLoad,
 		"load_distribution": loadDist,
 		"last_sync_time":    l.lastSyncTime,
 	}
@@ -183,7 +182,7 @@ func (l *Locator) syncActiveGateways(ctx context.Context) error {
 	// Find and add newly online instances
 	for newID, newInstance := range newState {
 		if _, existsLocally := l.instances[newID]; !existsLocally {
-			if err := l.ring.Add(ctx, newInstance.String()); err != nil {
+			if err := l.ring.Add(ctx, newInstance.MemberID()); err != nil {
 				log.Printf("Failed to add member %s to the ring: %v", newID, err)
 				continue
 			}

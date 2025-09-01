@@ -4,6 +4,8 @@ github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f h1:lO4WD4F/r
 github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f/go.mod h1:cuUVRXasLTGF7a8hSLbxyZXjz+1KgoB3wDUb6vlszIc=
 github.com/focusandinsist/consistent-go v0.0.0-20250826034151-6b924e54c38c h1:9SgAravT8D3UxHTQkvI/l9XU5tG6NBMet/O5bj4wS0c=
 github.com/focusandinsist/consistent-go v0.0.0-20250826034151-6b924e54c38c/go.mod h1:RexwRysvbsUahdzvA2W339eixuCFWHyPwYQnmA7jjS8=
+github.com/focusandinsist/consistent-go v0.0.0-20250901100356-02ec3b3ba4ed h1:dMmqtrkNR56O8xcayifACZ11x+dkzQEsRl3TzusI8uU=
+github.com/focusandinsist/consistent-go v0.0.0-20250901100356-02ec3b3ba4ed/go.mod h1:RexwRysvbsUahdzvA2W339eixuCFWHyPwYQnmA7jjS8=
 github.com/fsnotify/fsnotify v1.4.9 h1:hsms1Qyu0jgnwNXIxa+/V/PDsU6CfLf6CNO8H7IWoS4=
 github.com/fsnotify/fsnotify v1.4.9/go.mod h1:znqG4EE+3YCdAaPaxE2ZRY/06pZUdp0tY4IgpuI1SZQ=
 github.com/go-redis/redis/v8 v8.11.5 h1:AcZZR7igkdvfVmQTPnu9WE37LRrO/YrBH5zWyjDC0oI=
