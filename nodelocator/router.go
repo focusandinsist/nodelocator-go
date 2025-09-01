@@ -8,7 +8,6 @@ import (
 	"sync"
 	"time"
 
-	// "nodelocator/consistent"
 	"github.com/focusandinsist/consistent-go/consistent"
 )
 
@@ -37,14 +36,15 @@ type Locator struct {
 	ring         *consistent.Consistent
 	instances    map[string]*GatewayInstance // Instance ID -> Instance info
 	mu           sync.RWMutex
-	stopCh       chan struct{}
+	syncMu       sync.Mutex
 	syncTicker   *time.Ticker
 	lastSyncTime int64 // Last sync timestamp, used for detecting changes
 	config       *Config
+	cancelFn     context.CancelFunc
 }
 
 // NewLocator creates a new session locator.
-func NewLocator(registry ServiceRegistry, consisCfg consistent.Config, cfg *Config) *Locator {
+func NewLocator(registry ServiceRegistry, consisCfg consistent.Config, cfg *Config) (*Locator, error) {
 
 	if cfg == nil {
 		cfg = DefaultConfig()
@@ -52,25 +52,24 @@ func NewLocator(registry ServiceRegistry, consisCfg consistent.Config, cfg *Conf
 
 	ring, err := consistent.New(consisCfg)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("failed to create consistent hash ring: %w", err)
 	}
 	locator := &Locator{
 		registry:  registry,
 		ring:      ring,
 		instances: make(map[string]*GatewayInstance),
-		stopCh:    make(chan struct{}),
 		config:    cfg,
 	}
 
 	// Sync active instances from Redis at startup
-	if err := locator.syncActiveGateways(); err != nil {
+	if err := locator.syncActiveGateways(context.Background()); err != nil {
 		log.Printf("Failed to sync active gateways during initialization: %v", err)
 	}
 
 	// Start background monitoring task
 	locator.startMonitoring()
 
-	return locator
+	return locator, nil
 }
 
 // GetGatewayForUser gets the assigned gateway instance for a given user ID.
@@ -95,8 +94,13 @@ func (l *Locator) getGateway(ctx context.Context, key string) (*GatewayInstance,
 
 	member := l.ring.LocateKey(ctx, []byte(key))
 	if member == "" {
-		// This should theoretically not happen if instances are available
-		return nil, fmt.Errorf("could not locate a gateway for the given key")
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("operation cancelled: %w", ctx.Err())
+		default:
+			// Partition has no owner, indicates hash ring inconsistent state
+			return nil, fmt.Errorf("could not locate a gateway for the given key, hash ring may be in inconsistent state")
+		}
 	}
 
 	instance, ok := l.instances[member]
@@ -134,8 +138,9 @@ func (l *Locator) GetStats(ctx context.Context) map[string]interface{} {
 }
 
 // syncActiveGateways sync active gateway instances from Redis
-func (l *Locator) syncActiveGateways() error {
-	ctx := context.Background()
+func (l *Locator) syncActiveGateways(ctx context.Context) error {
+	l.syncMu.Lock()
+	defer l.syncMu.Unlock()
 
 	// 1: Get all active gateway IDs from Redis (lockless)
 	minScore := strconv.FormatInt(time.Now().Unix()-int64(l.config.HeartbeatWindow.Seconds()), 10)
@@ -165,7 +170,10 @@ func (l *Locator) syncActiveGateways() error {
 	// Find and remove offline instances
 	for localID := range l.instances {
 		if _, existsInNewState := newState[localID]; !existsInNewState {
-			l.ring.Remove(ctx, localID)
+			if err := l.ring.Remove(ctx, localID); err != nil {
+				log.Printf("Failed to remove member %s from the ring: %v", localID, err)
+				continue
+			}
 			delete(l.instances, localID)
 			removedCount++
 			log.Printf("Removed gateway instance: %s", localID)
@@ -175,8 +183,11 @@ func (l *Locator) syncActiveGateways() error {
 	// Find and add newly online instances
 	for newID, newInstance := range newState {
 		if _, existsLocally := l.instances[newID]; !existsLocally {
+			if err := l.ring.Add(ctx, newInstance.String()); err != nil {
+				log.Printf("Failed to add member %s to the ring: %v", newID, err)
+				continue
+			}
 			l.instances[newID] = newInstance
-			l.ring.Add(ctx, newInstance.String())
 			addedCount++
 			log.Printf("Added gateway instance: %s (%s)", newID, newInstance.GetAddress())
 		}
@@ -203,8 +214,13 @@ func (l *Locator) getInstanceDetails(ctx context.Context, instanceID string) (*G
 		return nil, fmt.Errorf("instance info does not exist")
 	}
 
+	host, ok := fields["host"]
+	if !ok || host == "" {
+		return nil, fmt.Errorf("instance %s is missing 'host' field", instanceID)
+	}
+
 	// Parse port number
-	port := 8080 // Default value
+	port := 8080
 	if portStr, exists := fields["port"]; exists {
 		if p, err := strconv.Atoi(portStr); err == nil {
 			port = p
@@ -212,16 +228,18 @@ func (l *Locator) getInstanceDetails(ctx context.Context, instanceID string) (*G
 	}
 
 	// Parse last heartbeat time
-	lastHeartbeat := time.Now().Unix()
-	if hbStr, exists := fields["last_ping"]; exists {
+	var lastHeartbeat int64
+	if hbStr, exists := fields["last_heartbeat"]; exists {
 		if hb, err := strconv.ParseInt(hbStr, 10, 64); err == nil {
 			lastHeartbeat = hb
 		}
+	} else {
+		return nil, fmt.Errorf("instance %s is missing 'last_heartbeat' field", instanceID)
 	}
 
 	return &GatewayInstance{
 		ID:            instanceID,
-		Host:          fields["host"],
+		Host:          host,
 		Port:          port,
 		LastHeartbeat: lastHeartbeat,
 	}, nil
@@ -231,20 +249,25 @@ func (l *Locator) getInstanceDetails(ctx context.Context, instanceID string) (*G
 func (l *Locator) startMonitoring() {
 	// Use sync interval defined in constants
 	l.syncTicker = time.NewTicker(l.config.SyncInterval)
-	go l.periodicSync()
+
+	var ctx context.Context
+	ctx, l.cancelFn = context.WithCancel(context.Background())
+
+	go l.periodicSync(ctx)
 }
 
 // periodicSync periodically sync active instances from Redis
-func (l *Locator) periodicSync() {
+func (l *Locator) periodicSync(ctx context.Context) {
 	defer l.syncTicker.Stop()
 
 	for {
 		select {
 		case <-l.syncTicker.C:
-			if err := l.syncActiveGateways(); err != nil {
+			if err := l.syncActiveGateways(ctx); err != nil {
 				log.Printf("Failed to periodically sync active gateways: %v", err)
 			}
-		case <-l.stopCh:
+		case <-ctx.Done():
+			log.Printf("Periodic sync stopped due to context cancellation")
 			return
 		}
 	}
@@ -252,13 +275,16 @@ func (l *Locator) periodicSync() {
 
 // Stop stop locator
 func (l *Locator) Stop() {
-	close(l.stopCh)
+	if l.cancelFn != nil {
+		l.cancelFn()
+	}
+
 	if l.syncTicker != nil {
 		l.syncTicker.Stop()
 	}
 }
 
 // ForceSync force sync (for manual trigger sync)
-func (l *Locator) ForceSync() error {
-	return l.syncActiveGateways()
+func (l *Locator) ForceSync(ctx context.Context) error {
+	return l.syncActiveGateways(ctx)
 }
